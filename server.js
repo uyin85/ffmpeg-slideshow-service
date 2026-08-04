@@ -171,7 +171,7 @@ app.post("/generate-video", async (req, res) => {
             "-t", String(durationPerImage),
             "-vf", "fps=24,format=yuv420p",
             "-c:v", "libx264",
-            "-preset", "veryfast",
+            "-preset", "ultrafast",
             "-x264-params", "rc-lookahead=10:ref=1",
             "-pix_fmt", "yuv420p",
             clipName
