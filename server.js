@@ -80,7 +80,7 @@ app.get("/", (req, res) => {
     status: "ok",
     message: "FFmpeg slideshow microservice berjalan",
     ffmpeg_path: ffmpegPath,
-    version: "2026-08-04-normalize-v4" // tukar string ni bila update, untuk confirm deploy terkini live
+    version: "2026-08-04-2stage-clips-v5" // tukar string ni bila update, untuk confirm deploy terkini live
   });
 });
 
@@ -151,36 +151,55 @@ app.post("/generate-video", async (req, res) => {
 
     const outputPath = path.join(workDir, "output.mp4");
 
-    // 2. Bina fail senarai untuk CONCAT DEMUXER — gambar SUDAH normalize (saiz/format
-    //    konsisten), jadi assembly ni tak perlukan scale/pad lagi, cuma gabung + fps.
-    const fileListPath = path.join(workDir, "filelist.txt");
-    let fileListContent = "";
+    // 2. PENDEKATAN 2-TAHAP (lebih robust) — setiap gambar jadi KLIP VIDEO sendiri dulu
+    //    (guna -loop 1 -t durasi, pattern FFmpeg yang sangat stabil/teruji), BARU gabung
+    //    klip-klip video tu. Ni elak known-quirk concat demuxer "duration directive" yang
+    //    kerap "makan" frame pertama bila terus assemble dari gambar statik.
+    const clipListPath = path.join(workDir, "cliplist.txt");
+    let clipListContent = "";
     for (let i = 0; i < images.length; i++) {
       const imgName = `img${String(i).padStart(3, "0")}.jpg`;
-      fileListContent += `file '${imgName}'\nduration ${durationPerImage}\n`;
-    }
-    // Concat demuxer perlukan fail TERAKHIR diulang tanpa duration (quirk yang didokumenkan) —
-    // kalau tidak, gambar terakhir akan "hilang"/durasi tak dikira dengan betul.
-    const lastImgName = `img${String(images.length - 1).padStart(3, "0")}.jpg`;
-    fileListContent += `file '${lastImgName}'\n`;
-    fs.writeFileSync(fileListPath, fileListContent);
+      const clipName = `clip${String(i).padStart(3, "0")}.mp4`;
 
-    // 3. Assemble jadi video — gambar dah SAMA saiz (720x1280), cuma perlu fps + format.
-    // Optimize untuk memory RENDAH (Render free tier cuma 512MB RAM):
-    // - Resolusi rendah (720x1280) — dah dinormalize di langkah 1
-    // - preset "veryfast" — kurangkan memory lookahead/motion-search encoder
-    // - rc-lookahead dihadkan — kurangkan buffer B-frame
-    // TikTok WAJIB frame rate minimum 23fps (kita guna 24fps, sikit di atas had minimum).
+      await new Promise((resolve, reject) => {
+        execFile(
+          ffmpegPath,
+          [
+            "-y",
+            "-loop", "1",
+            "-i", imgName,
+            "-t", String(durationPerImage),
+            "-vf", "fps=24,format=yuv420p",
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-x264-params", "rc-lookahead=10:ref=1",
+            "-pix_fmt", "yuv420p",
+            clipName
+          ],
+          { cwd: workDir, maxBuffer: 1024 * 1024 * 10 },
+          (error, stdout, stderr) => {
+            if (error) {
+              reject(new Error(`Bina klip ${i} gagal: ${error.message}\n${stderr || ""}`.slice(0, 1000)));
+              return;
+            }
+            resolve();
+          }
+        );
+      });
+      const clipStat = fs.statSync(path.join(workDir, clipName));
+      console.log(`Klip ${i} siap: size=${clipStat.size}`);
+      clipListContent += `file '${clipName}'\n`;
+    }
+    fs.writeFileSync(clipListPath, clipListContent);
+
+    // 3. Gabung SEMUA klip video (dah proper MP4 masing-masing) — stream-copy (tak re-encode
+    //    lagi, pantas & elak risiko quality-loss/quirk tambahan), guna concat demuxer.
     const ffmpegArgs = [
       "-y",
       "-f", "concat",
       "-safe", "0",
-      "-i", fileListPath,
-      "-vf", "fps=24,format=yuv420p",
-      "-c:v", "libx264",
-      "-preset", "veryfast",
-      "-x264-params", "rc-lookahead=10:ref=1",
-      "-pix_fmt", "yuv420p",
+      "-i", clipListPath,
+      "-c", "copy",
       "-movflags", "+faststart",
       outputPath
     ];
