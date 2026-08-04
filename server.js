@@ -92,19 +92,26 @@ app.post("/generate-video", async (req, res) => {
 
     // 2. Assemble jadi video — setiap gambar tunjuk selama `durationPerImage` saat,
     //    scale + pad ke 1080x1920 (format vertical standard TikTok), h264 untuk compatibility luas.
+    // Optimize untuk memory RENDAH (Render free tier cuma 512MB RAM):
+    // - Resolusi dikurangkan (720x1280 bukan 1080x1920) — kurangkan saiz frame buffer ~50%
+    // - fps output dikurangkan (12 bukan 25) — kurangkan jumlah frame perlu diproses/buffer
+    // - preset "veryfast" — kurangkan memory lookahead/motion-search encoder
+    // - rc-lookahead dihadkan — kurangkan buffer B-frame
     const ffmpegArgs = [
       "-y",
       "-framerate", `1/${durationPerImage}`,
       "-i", inputPattern,
-      "-vf", "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,fps=25,format=yuv420p",
+      "-vf", "scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2,fps=12,format=yuv420p",
       "-c:v", "libx264",
+      "-preset", "veryfast",
+      "-x264-params", "rc-lookahead=10:ref=1",
       "-pix_fmt", "yuv420p",
       "-movflags", "+faststart",
       outputPath
     ];
 
     await new Promise((resolve, reject) => {
-      execFile(ffmpegPath, ffmpegArgs, { maxBuffer: 1024 * 1024 * 50 }, (error, stdout, stderr) => {
+      execFile(ffmpegPath, ffmpegArgs, { maxBuffer: 1024 * 1024 * 20 }, (error, stdout, stderr) => {
         if (error) {
           reject(new Error(`FFmpeg gagal: ${error.message}\n${stderr || ""}`.slice(0, 2000)));
           return;
