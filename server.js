@@ -26,31 +26,52 @@ const PORT = process.env.PORT || 3000;
 // sebagai environment variable di Render Dashboard, dan Worker akan hantar header ni.
 const SERVICE_SECRET = process.env.SERVICE_SECRET || null;
 
-function downloadFile(url, filepath) {
+function downloadFile(url, filepath, redirectCount = 0) {
   return new Promise((resolve, reject) => {
+    if (redirectCount > 5) {
+      reject(new Error(`Terlalu banyak redirect untuk ${url}`));
+      return;
+    }
+
     const client = url.startsWith("https") ? https : http;
-    const file = fs.createWriteStream(filepath);
-    client
-      .get(url, (response) => {
-        if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
-          // Ikut redirect sekali (Cloudinary/media-proxy kadang redirect)
-          file.close();
-          fs.unlinkSync(filepath);
-          downloadFile(response.headers.location, filepath).then(resolve).catch(reject);
-          return;
-        }
-        if (response.statusCode !== 200) {
-          file.close();
-          reject(new Error(`Gagal muat turun ${url}: HTTP ${response.statusCode}`));
-          return;
-        }
-        response.pipe(file);
-        file.on("finish", () => file.close(resolve));
-      })
-      .on("error", (err) => {
-        try { fs.unlinkSync(filepath); } catch (e) {}
-        reject(err);
+    // Agent BARU setiap request (keepAlive false) — elak sebarang isu connection-reuse/pooling
+    // yang boleh punca response tersalah alamat/campur antara request berturutan.
+    const agent = new client.Agent({ keepAlive: false });
+
+    const request = client.get(url, { agent, headers: { "Cache-Control": "no-cache" } }, (response) => {
+      if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
+        response.resume(); // buang response lama sepenuhnya dulu
+        downloadFile(response.headers.location, filepath, redirectCount + 1).then(resolve).catch(reject);
+        return;
+      }
+      if (response.statusCode !== 200) {
+        response.resume();
+        reject(new Error(`Gagal muat turun ${url}: HTTP ${response.statusCode}`));
+        return;
+      }
+
+      const file = fs.createWriteStream(filepath);
+      response.pipe(file);
+
+      file.on("finish", () => {
+        file.close((closeErr) => {
+          if (closeErr) {
+            reject(closeErr);
+            return;
+          }
+          // Verify fail betul-betul ada kandungan (elak frame kosong/corrupt dalam video)
+          const stat = fs.statSync(filepath);
+          if (stat.size === 0) {
+            reject(new Error(`Fail kosong selepas muat turun: ${url}`));
+            return;
+          }
+          resolve();
+        });
       });
+      file.on("error", (err) => reject(err));
+    });
+
+    request.on("error", (err) => reject(err));
   });
 }
 
@@ -97,6 +118,9 @@ app.post("/generate-video", async (req, res) => {
     // - fps output dikurangkan (12 bukan 25) — kurangkan jumlah frame perlu diproses/buffer
     // - preset "veryfast" — kurangkan memory lookahead/motion-search encoder
     // - rc-lookahead dihadkan — kurangkan buffer B-frame
+    // TikTok WAJIB frame rate minimum 23fps (kita guna 24fps, sikit di atas had minimum).
+    // Kekalkan resolusi rendah (720x1280) + encoder settings ringan untuk jimat memory —
+    // fps 24 masih jauh lebih ringan dari 1080x1920@25fps asal yang sebabkan OOM crash.
     const ffmpegArgs = [
       "-y",
       "-framerate", `1/${durationPerImage}`,
