@@ -76,7 +76,12 @@ function downloadFile(url, filepath, redirectCount = 0) {
 }
 
 app.get("/", (req, res) => {
-  res.json({ status: "ok", message: "FFmpeg slideshow microservice berjalan", ffmpeg_path: ffmpegPath });
+  res.json({
+    status: "ok",
+    message: "FFmpeg slideshow microservice berjalan",
+    ffmpeg_path: ffmpegPath,
+    version: "2026-08-04-concat-demuxer-v3" // tukar string ni bila update, untuk confirm deploy terkini live
+  });
 });
 
 app.post("/generate-video", async (req, res) => {
@@ -118,22 +123,37 @@ app.post("/generate-video", async (req, res) => {
     console.log("SEMUA download log:", JSON.stringify(downloadLog));
 
     const outputPath = path.join(workDir, "output.mp4");
-    const inputPattern = path.join(workDir, "img%03d.jpg");
 
-    // 2. Assemble jadi video — setiap gambar tunjuk selama `durationPerImage` saat,
+    // 2. Bina fail senarai untuk CONCAT DEMUXER — kaedah lebih reliable untuk slideshow
+    //    berbanding "image2 sequence + framerate rendah" (yang kita jumpa ada isu dengan
+    //    sesetengah JPEG progressive/kompleks — separuh gambar "hilang" secara senyap).
+    //    Concat demuxer bagi DURATION EXPLICIT setiap fail, tak bergantung pada "trik"
+    //    pengiraan framerate/duplication automatik FFmpeg.
+    const fileListPath = path.join(workDir, "filelist.txt");
+    let fileListContent = "";
+    for (let i = 0; i < images.length; i++) {
+      const imgName = `img${String(i).padStart(3, "0")}.jpg`;
+      fileListContent += `file '${imgName}'\nduration ${durationPerImage}\n`;
+    }
+    // Concat demuxer perlukan fail TERAKHIR diulang tanpa duration (quirk yang didokumenkan) —
+    // kalau tidak, gambar terakhir akan "hilang"/durasi tak dikira dengan betul.
+    const lastImgName = `img${String(images.length - 1).padStart(3, "0")}.jpg`;
+    fileListContent += `file '${lastImgName}'\n`;
+    fs.writeFileSync(fileListPath, fileListContent);
+
+    // 3. Assemble jadi video — setiap gambar tunjuk selama `durationPerImage` saat,
     //    scale + pad ke 1080x1920 (format vertical standard TikTok), h264 untuk compatibility luas.
     // Optimize untuk memory RENDAH (Render free tier cuma 512MB RAM):
     // - Resolusi dikurangkan (720x1280 bukan 1080x1920) — kurangkan saiz frame buffer ~50%
-    // - fps output dikurangkan (12 bukan 25) — kurangkan jumlah frame perlu diproses/buffer
+    // - fps output dikurangkan (bukan 25 asal) — kurangkan jumlah frame perlu diproses/buffer
     // - preset "veryfast" — kurangkan memory lookahead/motion-search encoder
     // - rc-lookahead dihadkan — kurangkan buffer B-frame
     // TikTok WAJIB frame rate minimum 23fps (kita guna 24fps, sikit di atas had minimum).
-    // Kekalkan resolusi rendah (720x1280) + encoder settings ringan untuk jimat memory —
-    // fps 24 masih jauh lebih ringan dari 1080x1920@25fps asal yang sebabkan OOM crash.
     const ffmpegArgs = [
       "-y",
-      "-framerate", `1/${durationPerImage}`,
-      "-i", inputPattern,
+      "-f", "concat",
+      "-safe", "0",
+      "-i", fileListPath,
       "-vf", "scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2,fps=24,format=yuv420p",
       "-c:v", "libx264",
       "-preset", "veryfast",
@@ -144,7 +164,7 @@ app.post("/generate-video", async (req, res) => {
     ];
 
     await new Promise((resolve, reject) => {
-      execFile(ffmpegPath, ffmpegArgs, { maxBuffer: 1024 * 1024 * 20 }, (error, stdout, stderr) => {
+      execFile(ffmpegPath, ffmpegArgs, { cwd: workDir, maxBuffer: 1024 * 1024 * 20 }, (error, stdout, stderr) => {
         if (error) {
           reject(new Error(`FFmpeg gagal: ${error.message}\n${stderr || ""}`.slice(0, 2000)));
           return;
