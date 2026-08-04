@@ -80,7 +80,7 @@ app.get("/", (req, res) => {
     status: "ok",
     message: "FFmpeg slideshow microservice berjalan",
     ffmpeg_path: ffmpegPath,
-    version: "2026-08-04-concat-demuxer-v3" // tukar string ni bila update, untuk confirm deploy terkini live
+    version: "2026-08-04-normalize-v4" // tukar string ni bila update, untuk confirm deploy terkini live
   });
 });
 
@@ -107,28 +107,52 @@ app.post("/generate-video", async (req, res) => {
   fs.mkdirSync(workDir, { recursive: true });
 
   try {
-    // 1. Muat turun semua gambar, simpan dengan nama berurutan (img000.jpg, img001.jpg, ...)
+    // 1. Muat turun semua gambar, simpan dengan nama berurutan, KEMUDIAN normalize
+    //    (re-encode + scale/pad) SETIAP satu secara BERASINGAN sebelum assemble.
+    //    Ni elak sebarang quirk dari format asal (JPEG progressive/chroma-subsampling
+    //    berbeza dari Cloudinary) yang mungkin punca FFmpeg "skip"/duplicate frame
+    //    secara senyap semasa proses assembly gabungan.
     const downloadLog = [];
     for (let i = 0; i < images.length; i++) {
-      const filepath = path.join(workDir, `img${String(i).padStart(3, "0")}.jpg`);
-      await downloadFile(images[i], filepath);
-      // Log saiz fail + checksum ringkas (jumlah byte pertama 100) — untuk diagnose kalau
-      // ada fail yang "sama" secara tak sengaja (bug duplication/caching).
-      const buf = fs.readFileSync(filepath);
+      const rawFilepath = path.join(workDir, `raw${String(i).padStart(3, "0")}.jpg`);
+      await downloadFile(images[i], rawFilepath);
+
+      const buf = fs.readFileSync(rawFilepath);
       let simpleHash = 0;
       for (let b = 0; b < Math.min(buf.length, 1000); b++) simpleHash = (simpleHash + buf[b] * (b + 1)) % 999999937;
       downloadLog.push({ index: i, url: images[i], size: buf.length, hash: simpleHash });
       console.log(`Download img${i}: size=${buf.length} hash=${simpleHash} url=${images[i]}`);
+
+      // Normalize: scale+pad ke 720x1280 KONSISTEN, re-encode sebagai baseline JPEG bersih.
+      const normalizedFilepath = path.join(workDir, `img${String(i).padStart(3, "0")}.jpg`);
+      await new Promise((resolve, reject) => {
+        execFile(
+          ffmpegPath,
+          [
+            "-y", "-i", rawFilepath,
+            "-vf", "scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2",
+            "-q:v", "3",
+            normalizedFilepath
+          ],
+          { maxBuffer: 1024 * 1024 * 10 },
+          (error, stdout, stderr) => {
+            if (error) {
+              reject(new Error(`Normalize gambar ${i} gagal: ${error.message}\n${stderr || ""}`.slice(0, 1000)));
+              return;
+            }
+            resolve();
+          }
+        );
+      });
+      const normStat = fs.statSync(normalizedFilepath);
+      console.log(`Normalized img${i}: size=${normStat.size}`);
     }
     console.log("SEMUA download log:", JSON.stringify(downloadLog));
 
     const outputPath = path.join(workDir, "output.mp4");
 
-    // 2. Bina fail senarai untuk CONCAT DEMUXER — kaedah lebih reliable untuk slideshow
-    //    berbanding "image2 sequence + framerate rendah" (yang kita jumpa ada isu dengan
-    //    sesetengah JPEG progressive/kompleks — separuh gambar "hilang" secara senyap).
-    //    Concat demuxer bagi DURATION EXPLICIT setiap fail, tak bergantung pada "trik"
-    //    pengiraan framerate/duplication automatik FFmpeg.
+    // 2. Bina fail senarai untuk CONCAT DEMUXER — gambar SUDAH normalize (saiz/format
+    //    konsisten), jadi assembly ni tak perlukan scale/pad lagi, cuma gabung + fps.
     const fileListPath = path.join(workDir, "filelist.txt");
     let fileListContent = "";
     for (let i = 0; i < images.length; i++) {
@@ -141,11 +165,9 @@ app.post("/generate-video", async (req, res) => {
     fileListContent += `file '${lastImgName}'\n`;
     fs.writeFileSync(fileListPath, fileListContent);
 
-    // 3. Assemble jadi video — setiap gambar tunjuk selama `durationPerImage` saat,
-    //    scale + pad ke 1080x1920 (format vertical standard TikTok), h264 untuk compatibility luas.
+    // 3. Assemble jadi video — gambar dah SAMA saiz (720x1280), cuma perlu fps + format.
     // Optimize untuk memory RENDAH (Render free tier cuma 512MB RAM):
-    // - Resolusi dikurangkan (720x1280 bukan 1080x1920) — kurangkan saiz frame buffer ~50%
-    // - fps output dikurangkan (bukan 25 asal) — kurangkan jumlah frame perlu diproses/buffer
+    // - Resolusi rendah (720x1280) — dah dinormalize di langkah 1
     // - preset "veryfast" — kurangkan memory lookahead/motion-search encoder
     // - rc-lookahead dihadkan — kurangkan buffer B-frame
     // TikTok WAJIB frame rate minimum 23fps (kita guna 24fps, sikit di atas had minimum).
@@ -154,7 +176,7 @@ app.post("/generate-video", async (req, res) => {
       "-f", "concat",
       "-safe", "0",
       "-i", fileListPath,
-      "-vf", "scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2,fps=24,format=yuv420p",
+      "-vf", "fps=24,format=yuv420p",
       "-c:v", "libx264",
       "-preset", "veryfast",
       "-x264-params", "rc-lookahead=10:ref=1",
