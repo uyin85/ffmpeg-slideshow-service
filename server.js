@@ -101,7 +101,7 @@ app.post("/generate-video", async (req, res) => {
       "-y",
       "-framerate", `1/${durationPerImage}`,
       "-i", inputPattern,
-      "-vf", "scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2,fps=12,format=yuv420p",
+      "-vf", "scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2,fps=24,format=yuv420p",
       "-c:v", "libx264",
       "-preset", "veryfast",
       "-x264-params", "rc-lookahead=10:ref=1",
