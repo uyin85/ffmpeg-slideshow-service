@@ -103,10 +103,19 @@ app.post("/generate-video", async (req, res) => {
 
   try {
     // 1. Muat turun semua gambar, simpan dengan nama berurutan (img000.jpg, img001.jpg, ...)
+    const downloadLog = [];
     for (let i = 0; i < images.length; i++) {
       const filepath = path.join(workDir, `img${String(i).padStart(3, "0")}.jpg`);
       await downloadFile(images[i], filepath);
+      // Log saiz fail + checksum ringkas (jumlah byte pertama 100) — untuk diagnose kalau
+      // ada fail yang "sama" secara tak sengaja (bug duplication/caching).
+      const buf = fs.readFileSync(filepath);
+      let simpleHash = 0;
+      for (let b = 0; b < Math.min(buf.length, 1000); b++) simpleHash = (simpleHash + buf[b] * (b + 1)) % 999999937;
+      downloadLog.push({ index: i, url: images[i], size: buf.length, hash: simpleHash });
+      console.log(`Download img${i}: size=${buf.length} hash=${simpleHash} url=${images[i]}`);
     }
+    console.log("SEMUA download log:", JSON.stringify(downloadLog));
 
     const outputPath = path.join(workDir, "output.mp4");
     const inputPattern = path.join(workDir, "img%03d.jpg");
@@ -148,6 +157,12 @@ app.post("/generate-video", async (req, res) => {
     const stat = fs.statSync(outputPath);
     res.setHeader("Content-Type", "video/mp4");
     res.setHeader("Content-Length", stat.size);
+    // Sertakan ringkasan download (saiz + hash setiap gambar) sebagai header — untuk debug
+    // tanpa perlu check Render logs. Base64 sebab header value tak boleh ada newline/khas.
+    try {
+      const summary = downloadLog.map((d) => `${d.index}:${d.size}:${d.hash}`).join(",");
+      res.setHeader("X-Download-Summary", Buffer.from(summary).toString("base64"));
+    } catch (e) { /* tak kritikal, abaikan kalau gagal */ }
     const videoStream = fs.createReadStream(outputPath);
     videoStream.pipe(res);
     videoStream.on("close", () => {
